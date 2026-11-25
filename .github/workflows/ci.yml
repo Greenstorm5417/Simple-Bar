@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libdbus-1-dev unzip
+
+      - name: Install the bar font
+        run: |
+          mkdir -p ~/.local/share/fonts
+          curl -fsSL -o /tmp/font.zip \
+            https://github.com/ryanoasis/nerd-fonts/releases/download/v3.4.0/JetBrainsMono.zip
+          unzip -o /tmp/font.zip 'JetBrainsMonoNerdFont-*.ttf' -d ~/.local/share/fonts
+          fc-cache -f
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Test
+        run: cargo test
+
+      - name: Docs
+        run: cargo doc --no-deps
+
+      - name: Benchmarks compile
+        run: cargo bench --no-run
