@@ -219,12 +219,13 @@ impl Tray {
             }
             return false;
         }
-        let mut changed = false;
         let reply = match (iface.as_deref(), member.as_deref()) {
             (Some(WATCHER), Some("RegisterStatusNotifierItem")) => match msg.read1::<&str>() {
                 Ok(arg) => {
-                    changed = self.register(arg, msg.sender().as_deref().unwrap_or(""));
-                    Some(msg.method_return())
+                    // Synchronous registrants cannot serve icon properties until this reply arrives.
+                    let _ = self.bus.send(msg.method_return());
+                    self.bus.flush();
+                    return self.register(arg, msg.sender().as_deref().unwrap_or(""));
                 }
                 Err(_) => None,
             },
@@ -240,7 +241,7 @@ impl Tray {
         if let Some(reply) = reply.or_else(|| dbus::channel::default_reply(msg)) {
             let _ = self.bus.send(reply);
         }
-        changed
+        false
     }
 
     /// Take an item that registered with us. Returns whether it was added.
@@ -419,6 +420,45 @@ fn premultiply(argb: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "run under dbus-run-session"]
+    fn registers_synchronous_item() {
+        let mut tray = Tray::open().expect("open tray bus");
+        assert!(tray.own, "requires an isolated D-Bus session");
+        let item = std::thread::spawn(|| {
+            let bus = Channel::get_private(BusType::Session).expect("open item bus");
+            let proxy = Proxy::new(WATCHER, WATCHER_PATH, Duration::from_secs(2), &bus);
+            proxy
+                .method_call::<(), _, _, _>(WATCHER, "RegisterStatusNotifierItem", (ITEM_PATH,))
+                .expect("register item");
+            for _ in 0..30 {
+                bus.read_write(Some(Duration::from_millis(100)))
+                    .expect("read bus");
+                while let Some(msg) = bus.pop_message() {
+                    if msg.member().as_deref() == Some("Get") {
+                        let pixmaps = vec![(16i32, 16i32, vec![255u8; 16 * 16 * 4])];
+                        bus.send(msg.method_return().append1(Variant(pixmaps)))
+                            .expect("reply with icon");
+                        bus.flush();
+                        // Keep the item's name alive until the watcher consumes its icon.
+                        std::thread::sleep(Duration::from_millis(100));
+                        return;
+                    }
+                }
+            }
+            panic!("watcher never requested the icon");
+        });
+        for _ in 0..100 {
+            tray.dispatch();
+            if !tray.icons().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(tray.icons().len(), 1);
+        item.join().expect("item thread");
+    }
 
     #[test]
     fn splits_registration_arguments() {
