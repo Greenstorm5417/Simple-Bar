@@ -180,7 +180,18 @@ impl Model {
         self.refresh_battery()
     }
 
-    /// Show the clicked tag right away; Mango's next event confirms it.
+    /// Store one output's state, as dwl reports outputs one at a time.
+    /// Returns whether anything changed.
+    pub fn set_mon(&mut self, mon: Mon) -> bool {
+        if let Some(slot) = self.mons.iter_mut().find(|have| have.name == mon.name) {
+            replace(slot, mon)
+        } else {
+            self.mons.push(mon);
+            true
+        }
+    }
+
+    /// Show the clicked tag right away; the compositor's next event confirms it.
     pub fn focus_tag(&mut self, output: &str, index: u8) {
         let pos = self
             .mons

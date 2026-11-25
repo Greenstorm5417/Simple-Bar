@@ -131,6 +131,17 @@ pub struct HitRect {
     pub hit: Hit,
 }
 
+/// The title capsule's behavior when there is no focused window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmptyTitle {
+    /// Leave the capsule out.
+    #[default]
+    Hide,
+    /// Keep an empty capsule, as waybar's `dwl/window` does without
+    /// `hide-empty`.
+    Keep,
+}
+
 /// Everything one bar shows.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
@@ -138,6 +149,8 @@ pub struct Frame<'a> {
     pub tags: &'a [Tag],
     /// Focused window title.
     pub title: &'a str,
+    /// What to do with the title capsule when there is no title.
+    pub empty_title: EmptyTitle,
     /// Layout label, such as "\u{f0db} Fair".
     pub layout: &'a str,
     /// Temperature text.
@@ -275,6 +288,12 @@ impl Content {
     }
 }
 
+#[link(name = "fontconfig")]
+unsafe extern "C" {
+    /// Load the default fontconfig configuration; returns `FcFalse` on failure.
+    fn FcInit() -> std::ffi::c_int;
+}
+
 /// A measured string.
 #[derive(Clone, Copy, Debug)]
 struct Metrics {
@@ -304,8 +323,11 @@ impl Painter {
     /// # Errors
     /// Fails when cairo cannot allocate its 1×1 measuring surface.
     pub fn new() -> Result<Self, cairo::Error> {
-        // Touch the pangocairo font map once so fontconfig is initialized
-        // before cairo asks it for hinting.
+        // Pango 1.56 initializes fontconfig on a background thread; doing it
+        // here first keeps our first measurement from racing that thread
+        // ("Fontconfig warning: using without calling FcInit()").
+        // SAFETY: FcInit takes no arguments, is idempotent and thread-safe.
+        unsafe { FcInit() };
         let _map = pangocairo::FontMap::default();
         let probe = ImageSurface::create(Format::ARgb32, 1, 1)?;
         let layout = {
@@ -437,14 +459,17 @@ impl Painter {
         let content = Content::for_height(height);
         let mut pills = Vec::with_capacity(6);
         let mut hits = Vec::new();
-        // Waybar's workspaces are the bar box's center widget: GTK centers
-        // them and the left box only gets the space up to their margin.
+        // Waybar's bar is a GTK box with the workspaces as its center
+        // widget. GTK centers it unless the right side would overlap, then
+        // pushes it left; the left box gets the space up to its margin.
+        let right_start = self.layout_right(width, frame, content, &mut pills, &mut hits);
         let tags = (!frame.tags.is_empty())
-            .then(|| self.layout_tags(width, frame.tags, hover, content, &mut hits));
-        let left_end = tags.as_ref().map_or(width, |pill| pill.x - PILL_MARGIN_X);
+            .then(|| self.layout_tags(width, right_start, frame.tags, hover, content, &mut hits));
+        let left_end = tags
+            .as_ref()
+            .map_or(right_start, |pill| pill.x - PILL_MARGIN_X);
         self.layout_left(frame, content, left_end, &mut pills, &mut hits);
         pills.extend(tags);
-        self.layout_right(width, frame, content, &mut pills, &mut hits);
         (pills, hits)
     }
 
@@ -492,7 +517,7 @@ impl Painter {
             left += PILL_MARGIN_X + pill.w + PILL_MARGIN_X;
             pills.push(pill);
         }
-        if !frame.title.is_empty() {
+        if !frame.title.is_empty() || frame.empty_title == EmptyTitle::Keep {
             let x = left + PILL_MARGIN_X;
             // The title is the only module that can shrink (it ellipsizes),
             // so it absorbs any shortfall in the left box.
@@ -506,6 +531,7 @@ impl Painter {
     fn layout_tags(
         &mut self,
         width: f64,
+        right_start: f64,
         tags: &[Tag],
         hover: Option<&Hit>,
         content: Content,
@@ -538,7 +564,11 @@ impl Painter {
             w += WS_MARGIN_X * 2.0 + button.size().0;
             buttons.push(button);
         }
-        let x = (width - w) / 2.0;
+        // GTK: center_pos = (box - center) / 2 in whole pixels, margins
+        // included, then clamped so it ends where the right side begins.
+        let margin_box = w + 2.0 * PILL_MARGIN_X;
+        let centered = ((width - margin_box) / 2.0).floor();
+        let x = centered.min(right_start - margin_box) + PILL_MARGIN_X;
         let mut cursor = x + BORDER + WS_EDGE;
         for (tag, button) in tags.iter().zip(&buttons) {
             let (bw, bh) = button.size();
@@ -561,6 +591,7 @@ impl Painter {
     }
 
     /// Clock, controls group, and layout symbol, from the right edge in.
+    /// Returns where the right side's margin box begins.
     fn layout_right(
         &mut self,
         width: f64,
@@ -568,7 +599,7 @@ impl Painter {
         content: Content,
         pills: &mut Vec<Pill>,
         hits: &mut Vec<HitRect>,
-    ) {
+    ) -> f64 {
         let mut right = width;
         if !frame.clock.is_empty() {
             let piece = self.piece(frame.clock, FG, SOLO_PAD);
@@ -603,8 +634,10 @@ impl Painter {
                 rect: Rect::new(pill.x + BORDER + PILL_PAD_X, content.y, piece_w, content.h),
                 hit: Hit::Layout,
             });
+            right = pill.x - PILL_MARGIN_X;
             pills.push(pill);
         }
+        right
     }
 
     /// The controls group: speaker (when muted), mic, night light, battery,
@@ -1113,6 +1146,7 @@ mod tests {
         Frame {
             tags: &[],
             title: "title",
+            empty_title: EmptyTitle::Hide,
             layout: "",
             temp: "t",
             mem: "m",
@@ -1157,8 +1191,14 @@ mod tests {
         };
         // eDP-1 is 1422 logical px wide; the bar has 6 px side margins.
         let (pills, _) = painter.layout(1410.0, 44.0, &frame, None);
-        let title = &pills[1];
-        let workspaces = &pills[2];
+        let workspaces = pills
+            .iter()
+            .find(|pill| matches!(pill.body, Body::Tags(_)))
+            .unwrap();
+        let title = pills
+            .iter()
+            .find(|pill| matches!(&pill.body, Body::Pieces(p) if p[0].text.starts_with("Overview")))
+            .unwrap();
         assert!(matches!(&title.body, Body::Pieces(p) if p[0].ellipsize.is_some()));
         // Margin boxes touch: title right margin + workspace left margin.
         let gap = workspaces.x - (title.x + title.w);
@@ -1172,6 +1212,44 @@ mod tests {
     fn title_limit_is_45_hinted_cells() {
         let painter = Painter::new().unwrap();
         assert_eq!(painter.title_limit, 45 * 8 * pango::SCALE);
+    }
+
+    #[test]
+    fn workspaces_yield_to_the_right_side_on_narrow_outputs() {
+        let tags: Vec<Tag> = (1..=10)
+            .map(|index| Tag {
+                index,
+                active: index == 1,
+                urgent: false,
+            })
+            .collect();
+        let mut painter = Painter::new().unwrap();
+        painter.set_scale(1.0);
+        let narrow = Frame {
+            tags: &tags,
+            layout: "\u{f0db} Fair",
+            ..frame("04:30:35 PM")
+        };
+        let (pills, _) = painter.layout(701.0, 44.0, &narrow, None);
+        let workspaces = pills
+            .iter()
+            .find(|pill| matches!(pill.body, Body::Tags(_)))
+            .unwrap();
+        let right_start = pills
+            .iter()
+            .filter(|pill| pill.x > workspaces.x)
+            .map(|pill| pill.x)
+            .fold(f64::INFINITY, f64::min);
+        // Margin boxes touch instead of overlapping.
+        let gap = right_start - (workspaces.x + workspaces.w);
+        assert!((gap - 2.0 * PILL_MARGIN_X).abs() < 1e-9, "gap {gap}");
+        // On a wide output it stays centered.
+        let (wide, _) = painter.layout(1410.0, 44.0, &narrow, None);
+        let centered = wide
+            .iter()
+            .find(|pill| matches!(pill.body, Body::Tags(_)))
+            .unwrap();
+        assert!((centered.x + centered.w / 2.0 - 705.0).abs() <= 0.5);
     }
 
     #[test]
@@ -1220,6 +1298,7 @@ mod tests {
         Frame {
             tags,
             title: "\u{25d0} Custom bar alignment with Waybar",
+            empty_title: EmptyTitle::Hide,
             layout: "\u{f0db} Fair",
             temp: "\u{f2c9} 46\u{b0}C",
             mem: "\u{f035b} 5.4GB",

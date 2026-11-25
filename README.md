@@ -1,7 +1,8 @@
 # simple-bar
 
 A minimal, pixel-exact stand-in for the waybar setup in `~/.config/waybar`,
-for the [Mango](https://github.com/DreamMaoMao/mangowc) Wayland compositor.
+for the [Mango](https://github.com/DreamMaoMao/mangowc) and
+[dwl](https://codeberg.org/dwl/dwl) Wayland compositors.
 It draws the same capsules, fonts, colors and spacing with cairo and pango on
 a wlr layer surface, without GTK and without a thread or child process per
 module.
@@ -18,6 +19,24 @@ module.
 Left: tray, temperature, memory, window title. Center: workspaces.
 Right: layout, speaker/mic mute, night light, battery, kernel version, clock.
 Every text and click action matches the waybar config it replaces.
+
+## Compositors
+
+The same binary runs under both; it picks its source of workspaces, title
+and layout at startup:
+
+* **dwl** (with the IPC patch): when the compositor advertises
+  `zdwl_ipc_manager_v2`, the bar uses that protocol
+  (`protocols/dwl-ipc-unstable-v2.xml`), like waybar's `dwl/tags` and
+  `dwl/window` modules. Left click views a tag, right click toggles it into
+  the view, and the layout pill shows dwl's own symbol. With no focused
+  window the title pill stays as an empty capsule, as `dwl/window` does.
+* **Mango**: otherwise it reads Mango's `watch all-monitors` IPC socket.
+  Clicking the layout pill switches layouts.
+
+Audio is found the way libpulse finds it (`PULSE_SERVER`, then
+`PULSE_RUNTIME_PATH`, then `$XDG_RUNTIME_DIR/pulse`), so a session with its
+own runtime directory, like the dwl one, still reaches the shared server.
 
 ## How it stays small
 
@@ -90,6 +109,7 @@ startup. `valgrind --tool=dhat` shows heap churn and what stays live.
 | `src/battery.rs` | Waybar's battery percentage and status rules |
 | `src/launch.rs` | Click helpers (`wpctl`, night light), reaped |
 | `src/mango.rs` | Mango IPC stream and dispatch |
+| `src/dwl.rs` | dwl IPC protocol bindings and event batching |
 | `src/pulse.rs` | PulseAudio native-protocol client |
 | `src/tray.rs` | StatusNotifierItem host/watcher |
 | `src/uevent.rs` | Netlink power-supply events |
@@ -97,4 +117,5 @@ startup. `valgrind --tool=dhat` shows heap churn and what stays live.
 | `src/error.rs` | Startup and runtime errors |
 | `src/clock.rs` | Whole-second timerfd and clock text |
 | `src/json.rs` | Minimal JSON reader |
+| `protocols/` | `dwl-ipc-unstable-v2.xml`, from the dwl IPC patch |
 | `benches/bar.rs` | Parsing, layout and painting benchmarks |

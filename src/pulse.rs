@@ -5,6 +5,7 @@
 //! process and no `wpctl` fork per event; a mute flip is one round trip on
 //! a socket that is already open.
 
+use std::ffi::OsString;
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -66,16 +67,17 @@ impl AsFd for Pulse {
 }
 
 impl Pulse {
-    /// Connect to `$XDG_RUNTIME_DIR/pulse/native`, authenticate, subscribe,
+    /// Connect to the pulse socket (see [`socket_path`]), authenticate, subscribe,
     /// and ask for the initial mute flags. The answers arrive through
     /// [`Pulse::on_readable`].
     ///
     /// # Errors
     /// Fails when `XDG_RUNTIME_DIR` is unset or the socket cannot be used.
     pub fn connect() -> io::Result<Self> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-        let stream = UnixStream::connect(Path::new(&dir).join("pulse/native"))?;
+        let path = socket_path(|name| std::env::var_os(name)).ok_or_else(|| {
+            io::Error::new(ErrorKind::NotFound, "no PulseAudio socket configured")
+        })?;
+        let stream = UnixStream::connect(path)?;
         let mut pulse = Self {
             stream,
             rbuf: Vec::with_capacity(512),
@@ -249,6 +251,35 @@ impl Pulse {
         }
         Ok(())
     }
+}
+
+/// Where libpulse would connect: the first local server in `PULSE_SERVER`,
+/// else `native` in `PULSE_RUNTIME_PATH`, else `$XDG_RUNTIME_DIR/pulse/native`.
+/// A session with its own runtime directory (such as dwl's) shares the
+/// login session's server through these variables.
+pub fn socket_path(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(servers) = var("PULSE_SERVER")
+        && let Some(path) = servers.to_str().and_then(local_server)
+    {
+        return Some(path);
+    }
+    if let Some(dir) = var("PULSE_RUNTIME_PATH") {
+        return Some(PathBuf::from(dir).join("native"));
+    }
+    var("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("pulse/native"))
+}
+
+/// The first `unix:` (or bare absolute path) entry of a `PULSE_SERVER` list.
+/// Entries may carry a `{machine-id}` prefix.
+fn local_server(servers: &str) -> Option<PathBuf> {
+    servers.split_whitespace().find_map(|server| {
+        let server = match server.strip_prefix('{') {
+            Some(rest) => rest.split_once('}')?.1,
+            None => server,
+        };
+        let path = server.strip_prefix("unix:").unwrap_or(server);
+        path.starts_with('/').then(|| PathBuf::from(path))
+    })
 }
 
 /// Read the mute flag from a `GET_SINK_INFO`/`GET_SOURCE_INFO` reply body
@@ -437,6 +468,44 @@ mod tests {
         p.0.extend_from_slice(&[b'v', 2, 0, 1, 0, 0, 0, 1, 0, 0]);
         p.bool(muted);
         p.0
+    }
+
+    /// A fake environment for [`socket_path`].
+    fn env<'a>(pairs: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn finds_the_socket_like_libpulse() {
+        let base = [("XDG_RUNTIME_DIR", "/run/user/1000/dwl")];
+        assert_eq!(
+            socket_path(env(&base)),
+            Some("/run/user/1000/dwl/pulse/native".into())
+        );
+        let dwl = [
+            ("XDG_RUNTIME_DIR", "/run/user/1000/dwl"),
+            ("PULSE_RUNTIME_PATH", "/run/user/1000/pulse"),
+            ("PULSE_SERVER", "unix:/run/user/1000/pulse/native"),
+        ];
+        assert_eq!(
+            socket_path(env(&dwl)),
+            Some("/run/user/1000/pulse/native".into())
+        );
+        let runtime_only = [("PULSE_RUNTIME_PATH", "/run/user/1000/pulse")];
+        assert_eq!(
+            socket_path(env(&runtime_only)),
+            Some("/run/user/1000/pulse/native".into())
+        );
+        let remote_first = [("PULSE_SERVER", "tcp:host:4713 {abc}unix:/tmp/p/native")];
+        assert_eq!(
+            socket_path(env(&remote_first)),
+            Some("/tmp/p/native".into())
+        );
     }
 
     #[test]

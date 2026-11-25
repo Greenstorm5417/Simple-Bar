@@ -10,7 +10,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use simple_bar::mango::{Tag, parse_monitors};
 use simple_bar::model::KernelClass;
-use simple_bar::paint::{Canvas, Frame, Painter, damage};
+use simple_bar::paint::{Canvas, EmptyTitle, Frame, Painter, damage};
 use simple_bar::{json, pulse};
 
 /// A real `watch all-monitors` line captured from Mango.
@@ -34,6 +34,7 @@ fn frame<'a>(tags: &'a [Tag], clock: &'a str) -> Frame<'a> {
     Frame {
         tags,
         title: "Greenstorm5417/kisslock \u{2014} LibreWolf",
+        empty_title: EmptyTitle::Hide,
         layout: "\u{f0db} Fair",
         temp: "\u{f2c9} 38\u{b0}C",
         mem: "\u{f035b} 3.5GB",

@@ -37,16 +37,18 @@ use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::clock::{self, SecondTimer};
+use crate::dwl::{self, OutputState as DwlState, ZdwlIpcManagerV2, ZdwlIpcOutputV2};
 use crate::error::{Error, Result};
 use crate::launch::Launcher;
 use crate::mango::{self, Mango};
 use crate::model::{self, Kernel, Model};
-use crate::paint::{self, Canvas, Frame, Hit, HitRect, Painter, Pill};
+use crate::paint::{self, Canvas, EmptyTitle, Frame, Hit, HitRect, Painter, Pill};
 use crate::pulse::{Device, Pulse};
 use crate::tray::{Tray, TrayIcon};
 use crate::uevent::{PowerEvents, Uevents};
 
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 /// Memory refresh, waybar's `memory` interval; night light and battery
 /// ride along (waybar polls the battery only every 60 s, so it can lag).
 const SENSORS_EVERY: u32 = 5;
@@ -94,6 +96,21 @@ impl Scale {
     }
 }
 
+/// How the bar learns about workspaces, the title and the layout.
+enum Ipc {
+    /// Mango's `watch all-monitors` socket; `connected` is false while it
+    /// is being retried.
+    Mango { connected: bool },
+    /// dwl's `dwl-ipc-unstable-v2` Wayland protocol.
+    Dwl(ZdwlIpcManagerV2),
+}
+
+/// A bar's dwl IPC object and the batch of events it is collecting.
+struct DwlOutput {
+    proxy: ZdwlIpcOutputV2,
+    state: DwlState,
+}
+
 /// Where the pointer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Hover {
@@ -120,6 +137,7 @@ struct Bar {
     painted: Option<Geometry>,
     pills: Vec<Pill>,
     hits: Vec<HitRect>,
+    dwl: Option<DwlOutput>,
 }
 
 impl Bar {
@@ -221,7 +239,7 @@ struct App {
     painter: Painter,
     model: Model,
     pulse: Option<Pulse>,
-    mango_connected: bool,
+    ipc: Ipc,
     tray: Option<Tray>,
     launcher: Launcher,
     clock: String,
@@ -263,6 +281,10 @@ impl App {
         let fractional_mgr = globals.bind(qh, 1..=1, GlobalUd).ok();
         let viewporter = globals.bind(qh, 1..=1, GlobalUd).ok();
         let cursor_mgr = globals.bind(qh, 1..=1, GlobalUd).ok();
+        // dwl advertises its IPC global; anything else is taken to be Mango.
+        let ipc = globals
+            .bind::<ZdwlIpcManagerV2, _, _>(qh, 1..=2, GlobalUd)
+            .map_or(Ipc::Mango { connected: false }, Ipc::Dwl);
         let mut painter = Painter::new()?;
         let mut clock = String::new();
         clock::write(&mut clock);
@@ -285,7 +307,7 @@ impl App {
             painter,
             model: Model::open(),
             pulse: None,
-            mango_connected: false,
+            ipc,
             tray: Tray::open().ok(),
             launcher: Launcher::default(),
             clock,
@@ -300,7 +322,9 @@ impl App {
     /// retried from the clock tick.
     fn start_sources(&mut self) -> Result<()> {
         self.connect_pulse();
-        self.connect_mango();
+        if matches!(self.ipc, Ipc::Mango { .. }) {
+            self.connect_mango();
+        }
         self.watch_tray();
         self.watch_power();
 
@@ -379,11 +403,13 @@ impl App {
                     }
                     Ok(None) => Ok(PostAction::Continue),
                     Err(_) => {
-                        app.mango_connected = false;
+                        app.ipc = Ipc::Mango { connected: false };
                         Ok(PostAction::Remove)
                     }
                 });
-        self.mango_connected = inserted.is_ok();
+        self.ipc = Ipc::Mango {
+            connected: inserted.is_ok(),
+        };
     }
 
     fn watch_tray(&mut self) {
@@ -450,7 +476,7 @@ impl App {
             if self.pulse.is_none() {
                 self.connect_pulse();
             }
-            if !self.mango_connected {
+            if matches!(self.ipc, Ipc::Mango { connected: false }) {
                 self.connect_mango();
             }
         }
@@ -467,8 +493,13 @@ impl App {
             hover,
             fractional_mgr,
             dirty,
+            ipc,
             ..
         } = self;
+        let empty_title = match ipc {
+            Ipc::Dwl(_) => EmptyTitle::Keep,
+            Ipc::Mango { .. } => EmptyTitle::Hide,
+        };
         let tray_icons = tray.as_ref().map_or(&[][..], Tray::icons);
         for bar in bars.iter_mut().filter(|bar| bar.configured) {
             if fractional_mgr.is_some()
@@ -483,7 +514,8 @@ impl App {
             let frame = Frame {
                 tags: mon.map_or(&[], |mon| &mon.tags),
                 title: mon.map_or("", |mon| &mon.title),
-                layout: mon.map_or("", |mon| mon.layout_text),
+                empty_title,
+                layout: mon.map_or("", |mon| &mon.layout_text),
                 temp: &model.temp,
                 mem: &model.mem,
                 battery: &model.battery,
@@ -552,20 +584,13 @@ impl App {
 
     fn activate(&mut self, bar: BarId, hit: Hit) {
         match hit {
-            Hit::Tag(index) => {
-                let output = self
-                    .bars
-                    .iter()
-                    .find(|b| b.id == bar)
-                    .map(|b| b.name.clone())
-                    .unwrap_or_default();
-                self.model.focus_tag(&output, index);
-                self.dirty = true;
-                // A dead socket gets picked up by the reconnect tick.
-                let _ = mango::dispatch(&format!("view,{index}"));
-            }
+            Hit::Tag(index) => self.view_tag(bar, index),
             Hit::Layout => {
-                let _ = mango::dispatch("switch_layout");
+                // Waybar's dwl layout module has no click action.
+                if matches!(self.ipc, Ipc::Mango { .. }) {
+                    // A dead socket gets picked up by the reconnect tick.
+                    let _ = mango::dispatch("switch_layout");
+                }
             }
             Hit::Speaker => self.toggle_mute(Device::Sink),
             Hit::Mic => self.toggle_mute(Device::Source),
@@ -579,6 +604,40 @@ impl App {
                     tray.activate(index);
                 }
             }
+        }
+    }
+
+    /// Left click on a tag: show only that tag.
+    fn view_tag(&mut self, bar: BarId, index: u8) {
+        let Some(bar) = self.bars.iter().find(|b| b.id == bar) else {
+            return;
+        };
+        match (&self.ipc, &bar.dwl) {
+            (Ipc::Dwl(_), Some(dwl)) => {
+                let (tags, toggle_tagset) = dwl::view_tag(index);
+                dwl.proxy.set_tags(tags, toggle_tagset);
+            }
+            (Ipc::Dwl(_), None) => return,
+            (Ipc::Mango { .. }, _) => {
+                // A dead socket gets picked up by the reconnect tick.
+                let _ = mango::dispatch(&format!("view,{index}"));
+            }
+        }
+        let output = bar.name.clone();
+        self.model.focus_tag(&output, index);
+        self.dirty = true;
+    }
+
+    /// Right click on a tag: add it to or remove it from the view (dwl).
+    fn toggle_tag(&self, bar: BarId, index: u8) {
+        if let Some(dwl) = self
+            .bars
+            .iter()
+            .find(|b| b.id == bar)
+            .and_then(|b| b.dwl.as_ref())
+        {
+            let (tags, toggle_tagset) = dwl::toggle_tag(index, dwl.state.active_mask());
+            dwl.proxy.set_tags(tags, toggle_tagset);
         }
     }
 
@@ -671,6 +730,13 @@ impl OutputHandler for App {
             .as_ref()
             .map(|porter| porter.get_viewport(layer.wl_surface(), qh, GlobalUd));
         layer.commit();
+        let dwl = match &self.ipc {
+            Ipc::Dwl(manager) => Some(DwlOutput {
+                proxy: manager.get_output(&output, qh, DwlUd(id)),
+                state: DwlState::default(),
+            }),
+            Ipc::Mango { .. } => None,
+        };
         self.bars.push(Bar {
             id,
             output: output.clone(),
@@ -691,6 +757,7 @@ impl OutputHandler for App {
             painted: None,
             pills: Vec::new(),
             hits: Vec::new(),
+            dwl,
         });
         self.sync_output(&output);
     }
@@ -832,6 +899,11 @@ impl PointerHandler for App {
                         self.activate(id, hit);
                     }
                 }
+                PointerEventKind::Press { button, .. } if button == BTN_RIGHT => {
+                    if let Some(Hit::Tag(index)) = target {
+                        self.toggle_tag(id, index);
+                    }
+                }
                 PointerEventKind::Axis { vertical, .. } => {
                     // Waybar gives the speaker widget no width unless it is
                     // muted, so scrolling only lands on the mute icon.
@@ -880,6 +952,31 @@ impl Dispatch2<WpFractionalScaleV1, App> for ScaleUd {
     }
 }
 
+/// User data for a bar's dwl IPC output.
+struct DwlUd(BarId);
+
+impl Dispatch2<ZdwlIpcOutputV2, App> for DwlUd {
+    fn event(
+        &self,
+        app: &mut App,
+        _: &ZdwlIpcOutputV2,
+        event: dwl::zdwl_ipc_output_v2::Event,
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        let Some(bar) = app.bars.iter_mut().find(|bar| bar.id == self.0) else {
+            return;
+        };
+        let Some(dwl) = bar.dwl.as_mut() else {
+            return;
+        };
+        if dwl.state.apply(event) {
+            let mon = dwl.state.to_mon(&bar.name);
+            app.dirty |= app.model.set_mon(mon);
+        }
+    }
+}
+
 macro_rules! ignore_events {
     ($ud:ty => $($iface:ty),+ $(,)?) => {$(
         impl Dispatch2<$iface, App> for $ud {
@@ -897,6 +994,7 @@ macro_rules! ignore_events {
 }
 
 ignore_events!(GlobalUd =>
+    ZdwlIpcManagerV2,
     WpFractionalScaleManagerV1,
     WpViewporter,
     WpViewport,

@@ -1,5 +1,6 @@
 //! Mango compositor IPC: the `watch all-monitors` stream and dispatches.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -29,8 +30,9 @@ pub struct Mon {
     pub active: bool,
     /// Focused window title, with control characters removed.
     pub title: String,
-    /// Layout label for the layout module.
-    pub layout_text: &'static str,
+    /// Layout label for the layout module: Mango's symbols map to fixed
+    /// labels, dwl's symbol is shown as sent.
+    pub layout_text: Cow<'static, str>,
     /// Workspaces.
     pub tags: Vec<Tag>,
 }
@@ -181,12 +183,12 @@ fn mon_from_value(value: &Json<'_>) -> Option<Mon> {
         name: value.get("name")?.as_str()?.to_owned(),
         active: flag(value, "active"),
         title,
-        layout_text: layout_text(
+        layout_text: Cow::Borrowed(layout_text(
             value
                 .get("layout_symbol")
                 .and_then(Json::as_str)
                 .unwrap_or(""),
-        ),
+        )),
         tags,
     })
 }

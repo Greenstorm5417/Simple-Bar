@@ -9,6 +9,7 @@
 mod app;
 pub mod battery;
 pub mod clock;
+pub mod dwl;
 mod error;
 pub mod json;
 mod launch;
